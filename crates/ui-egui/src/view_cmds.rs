@@ -459,8 +459,6 @@ fn wraps(id: &str) -> bool {
             | "type.pasteLoremIpsum"
             | "image.applyImage"
             | "image.calculations"
-            | "select.saveSelection"
-            | "select.loadSelection"
     )
 }
 
@@ -1120,16 +1118,8 @@ fn front(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<Val
                 "add",
                 "subtract",
             ];
-            // The active layer's transparency, and its mask only when it has one.
-            let layer = st.active_layer.and_then(|l| d.layer(l));
             let mut load = chans.clone();
-            if layer.is_some() {
-                load.push("transparency".into());
-            }
-            if layer.is_some_and(|l| l.mask.is_some()) {
-                load.push("mask".into());
-            }
-            load.push("selection".into());
+            load.extend(["transparency", "mask", "selection"].map(String::from));
             match id {
                 "select.saveSelection" => dialog(
                     app,
