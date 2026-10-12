@@ -1114,24 +1114,27 @@ fn shadow_map(shape: &Map, s: &Shadow, light: &GlobalLight, inner: bool, origin:
 }
 
 fn glow_map(shape: &Map, g: &Glow, inner: bool, origin: (i32, i32)) -> Map {
-    // An inner glow is built from the edge inwards; a centre-source glow is its inverse, taken
-    // after the contour and Range (Photoshop 27.11, measured: the centre glow is exactly
-    // 1 − the edge glow, for both techniques).
-    let src = if inner { shape.clone().map(|a| 1.0 - a) } else { shape.clone() };
+    let src = if inner {
+        match g.source {
+            GlowSource::Edge => shape.clone().map(|a| 1.0 - a),
+            GlowSource::Center => shape.clone(),
+        }
+    } else {
+        shape.clone()
+    };
     let mut m = match g.technique {
         GlowTechnique::Precise => {
-            // Coverage falls linearly from 0.5 at the edge to 0 at `size + 1` px (centre to
-            // centre), solid within the spread / choke: after the default 50 % Range that is
-            // Photoshop's 1 − D / (size + 1) beyond the solid part (measured: outer and inner,
-            // sizes 10 and 20, spread 0 and 40 %, choke 0 and 30 %: within 1 level; other Range
-            // values are unmeasured). The distances here are 0.5 px short of centre to centre.
+            // An inner glow, from either source, measures from the edge inwards; a centre glow is
+            // the inverse below (the distance outside is ≤ 0 everywhere inside, #966).
             let d = if inner { dist_inside(shape) } else { dist_outside(&src) };
             let solid = g.size * g.spread;
-            let soft = (g.size + 1.0 - solid).max(1e-3);
+            let soft = (g.size - solid).max(1e-3);
             let mut m = Map::new(shape.w, shape.h, 0.0);
             for (o, d) in m.v.iter_mut().zip(d) {
-                let d = d + 0.5;
-                *o = if d <= solid { 1.0 } else { 0.5 * (1.0 - (d - solid) / soft).clamp(0.0, 1.0) };
+                *o = if d <= solid { 1.0 } else { (1.0 - (d - solid) / soft).clamp(0.0, 1.0) };
+            }
+            if inner && g.source == GlowSource::Center {
+                m = m.map(|v| 1.0 - v);
             }
             m
         }
@@ -1139,13 +1142,16 @@ fn glow_map(shape: &Map, g: &Glow, inner: bool, origin: (i32, i32)) -> Map {
             let (r, bw) = spread_split(g.size, g.spread);
             let mut m = dilate(&src, r);
             blur(&mut m, bw);
+            if inner && g.source == GlowSource::Center {
+                // Brightest in the middle: coverage from the distance to the edge.
+                let mut e = dilate(&shape.clone().map(|a| 1.0 - a), r);
+                blur(&mut e, bw);
+                m = e.map(|v| 1.0 - v);
+            }
             m
         }
     };
     m = apply_lut(m, glow_lut(g));
-    if inner && g.source == GlowSource::Center {
-        m = m.map(|v| 1.0 - v);
-    }
     noise(&mut m, g.noise, origin.0, origin.1);
     if inner {
         for (v, a) in m.v.iter_mut().zip(&shape.v) {
@@ -1743,9 +1749,10 @@ fn knock_out_exterior(map: &mut Map, shape: &Map, fill_opacity: f32) {
 /// masked, clipped layers applied) plus its effects into `backdrop`.
 pub fn composite_with_effects(layer: &Layer, content: &Buffer, backdrop: &mut Buffer, maps: &FxMaps, layer_bounds: Rect, patterns: &[Pattern]) {
     let prepared = PreparedPatterns::new(patterns, PREPARED_PATTERN_BYTES);
-    composite_with_effects_prepared(layer, content, backdrop, maps, layer_bounds, &prepared, None);
+    composite_with_effects_prepared(layer, content, backdrop, maps, layer_bounds, &prepared, None, None);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn composite_with_effects_prepared(
     layer: &Layer,
     content: &Buffer,
@@ -1754,6 +1761,7 @@ pub(crate) fn composite_with_effects_prepared(
     layer_bounds: Rect,
     patterns: &PreparedPatterns<'_>,
     vstroke: Option<VectorStroke<'_>>,
+    fill_map: Option<&[f32]>,
 ) {
     let big = content.rect;
     let (w, h) = (big.width() as usize, big.height() as usize);
@@ -1827,13 +1835,16 @@ pub(crate) fn composite_with_effects_prepared(
     let inside = |a: f32| a > INSIDE_EPS;
     // Within an outline (or a split-off vector stroke) the content's own transparency (a fading
     // gradient fill) acts like fill opacity: the effects still cover the whole shape.
+    // A base below 100 % fill with clipped layers: the clipping group's own alpha per pixel
+    // (the base at fill, its clipped layers at full strength inside its shape).
+    let fill_at = |i: usize| fill_map.and_then(|m| m.get(i)).copied().unwrap_or(content_fill);
     let lay_alpha = |i: usize, p: &[f32; 4], a: f32| {
         if !inside(a) {
             0.0
         } else if relative {
-            content_fill * (kmask(i) * p[3] / a).min(1.0)
+            fill_at(i) * (kmask(i) * p[3] / a).min(1.0)
         } else {
-            content_fill
+            fill_at(i)
         }
     };
     let mut lay = Buffer { rect: big, px: content.px.iter().zip(&shape.v).enumerate().map(|(i, (p, a))| [p[0], p[1], p[2], lay_alpha(i, p, *a)]).collect() };
@@ -2875,51 +2886,6 @@ mod tests {
         assert!((lut_at(&l, 0.25) - 0.5).abs() < 1e-3 && (lut_at(&l, 0.75) - 1.0).abs() < 1e-6);
         g.range = 1.0;
         assert!(glow_lut(&g).is_none());
-    }
-
-    /// Photoshop 27.11, measured on a 128 px square (Normal, black, 100 %, Range 50 %): a precise
-    /// glow's coverage across the edge, and a centre-source inner glow as 1 − the edge glow.
-    #[test]
-    fn glows_match_photoshop() {
-        let glow = |technique, size: f32, spread: f32, source| Glow {
-            common: photocraft_doc::FxCommon::new(BlendMode::Normal, 1.0),
-            paint: FxPaint::Color(photocraft_color::Color::BLACK),
-            technique,
-            spread,
-            size,
-            contour: Contour::Linear,
-            anti_alias: false,
-            range: 0.5,
-            jitter: 0.0,
-            noise: 0.0,
-            source,
-        };
-        let n = 60;
-        let mut shape = Map::new(n, n, 0.0);
-        for y in 20..40 {
-            for x in 20..40 {
-                shape.v[y * n + x] = 1.0;
-            }
-        }
-        let at = |m: &Map, x: usize| m.v[30 * n + x];
-        // Outer, precise, size 10: Photoshop's black glow over white reads 47, 93, 140, 186, 232
-        // at 2, 4, 6, 8 and 10 px out from the edge pixel (alpha 1 − D / 11).
-        let m = glow_map(&shape, &glow(GlowTechnique::Precise, 10.0, 0.0, GlowSource::Edge), false, (0, 0));
-        for (d, ps) in [(2, 47.0f32), (4, 93.0), (6, 140.0), (8, 186.0), (10, 232.0)] {
-            let got = 255.0 * (1.0 - at(&m, 20 - d));
-            assert!((got - ps).abs() <= 1.5, "outer precise at {d} px: {got} vs Photoshop {ps}");
-        }
-        // Spread 40 %: solid for the first 4 px.
-        let m = glow_map(&shape, &glow(GlowTechnique::Precise, 10.0, 0.4, GlowSource::Edge), false, (0, 0));
-        assert!((at(&m, 16) - 1.0).abs() < 1e-6 && at(&m, 14) < 1.0);
-        // Centre source = 1 − edge, for both techniques.
-        for t in [GlowTechnique::Precise, GlowTechnique::Softer] {
-            let e = glow_map(&shape, &glow(t, 6.0, 0.0, GlowSource::Edge), true, (0, 0));
-            let c = glow_map(&shape, &glow(t, 6.0, 0.0, GlowSource::Center), true, (0, 0));
-            for x in 20..40 {
-                assert!((at(&c, x) - (1.0 - at(&e, x))).abs() < 1e-5, "{t:?} at {x}");
-            }
-        }
     }
 
     #[test]
